@@ -27,6 +27,7 @@ func (config *Config) HotRemoveVhd(hostPath string) error {
 		Request: "Remove",
 	}
 	if err := config.Uvm.Modify(modification); err != nil {
+		config.GetErrorLogs()
 		return fmt.Errorf("failed modifying utility VM for hot-remove %s: %s", hostPath, err)
 	}
 	logrus.Debugf("opengcs: HotRemoveVhd: %s removed successfully", hostPath)

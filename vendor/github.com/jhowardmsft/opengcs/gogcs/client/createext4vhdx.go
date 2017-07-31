@@ -91,6 +91,7 @@ func (config *Config) CreateExt4Vhdx(destFile string, sizeGB uint32, cacheFile s
 	testdCommand := fmt.Sprintf(`test -d /sys/bus/scsi/devices/%d:0:0:%d`, controller, lun)
 	testdProc, err := config.RunProcess(testdCommand, nil, nil, nil)
 	if err != nil {
+		config.GetErrorLogs()
 		config.dismount(destFile)
 		return fmt.Errorf("failed to `%s` following hot-add %s to utility VM: %s", testdCommand, destFile, err)
 	}
@@ -102,6 +103,7 @@ func (config *Config) CreateExt4Vhdx(destFile string, sizeGB uint32, cacheFile s
 		return fmt.Errorf("failed to get exit code from `%s` following hot-add %s to utility VM: %s", testdCommand, destFile, err)
 	}
 	if testdExitCode != 0 {
+		config.GetErrorLogs()
 		config.dismount(destFile)
 		return fmt.Errorf("`%s` return non-zero exit code (%d) following hot-add %s to utility VM", testdCommand, testdExitCode, destFile)
 	}
@@ -111,6 +113,7 @@ func (config *Config) CreateExt4Vhdx(destFile string, sizeGB uint32, cacheFile s
 	var lsOutput bytes.Buffer
 	lsProc, err := config.RunProcess(lsCommand, nil, &lsOutput, nil)
 	if err != nil {
+		config.GetErrorLogs()
 		config.dismount(destFile)
 		return fmt.Errorf("failed to `%s` following hot-add %s to utility VM: %s", lsCommand, destFile, err)
 	}
@@ -122,6 +125,7 @@ func (config *Config) CreateExt4Vhdx(destFile string, sizeGB uint32, cacheFile s
 		return fmt.Errorf("failed to get exit code from `%s` following hot-add %s to utility VM: %s", lsCommand, destFile, err)
 	}
 	if lsExitCode != 0 {
+		config.GetErrorLogs()
 		config.dismount(destFile)
 		return fmt.Errorf("`%s` return non-zero exit code (%d) following hot-add %s to utility VM", lsCommand, lsExitCode, destFile)
 	}
@@ -133,6 +137,7 @@ func (config *Config) CreateExt4Vhdx(destFile string, sizeGB uint32, cacheFile s
 	var mkfsStderr bytes.Buffer
 	mkfsProc, err := config.RunProcess(mkfsCommand, nil, nil, &mkfsStderr)
 	if err != nil {
+		config.GetErrorLogs()
 		config.dismount(destFile)
 		return fmt.Errorf("failed to RunProcess %q following hot-add %s to utility VM: %s", destFile, mkfsCommand, err)
 	}
@@ -144,6 +149,7 @@ func (config *Config) CreateExt4Vhdx(destFile string, sizeGB uint32, cacheFile s
 		return fmt.Errorf("failed to get exit code from `%s` following hot-add %s to utility VM: %s", mkfsCommand, destFile, err)
 	}
 	if mkfsExitCode != 0 {
+		config.GetErrorLogs()
 		config.dismount(destFile)
 		return fmt.Errorf("`%s` return non-zero exit code (%d) following hot-add %s to utility VM: %s", mkfsCommand, mkfsExitCode, destFile, strings.TrimSpace(mkfsStderr.String()))
 	}

@@ -36,6 +36,7 @@ func (config *Config) VhdToTar(vhdFile string, uvmMountPath string, isSandbox bo
 	// Start the binary in the utility VM
 	process, err := config.createUtilsProcess(command)
 	if err != nil {
+		config.GetErrorLogs()
 		return nil, fmt.Errorf("opengcs: VhdToTar: %s: failed to create utils process %s: %s", vhdHandle.Name(), command, err)
 	}
 

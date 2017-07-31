@@ -3,8 +3,12 @@
 package client
 
 import (
+	"bytes"
 	"fmt"
 	"io"
+	"os"
+	"strings"
+	"time"
 
 	"github.com/Microsoft/hcsshim"
 	"github.com/Sirupsen/logrus"
@@ -109,4 +113,29 @@ func (config *Config) RunProcess(commandLine string, stdin io.Reader, stdout io.
 
 	logrus.Debugf("opengcs: runProcess success: %s", commandLine)
 	return process.Process, nil
+}
+
+// GetErrorLogs gets the error logs from the GCS. It's a hack for debugging
+func (config *Config) GetErrorLogs() {
+	if logrus.GetLevel() < logrus.DebugLevel {
+		return
+	}
+	logrus.Debugln("attempting to get error logs from GCS")
+	var out bytes.Buffer
+	cmd := os.Getenv("OPENGCS_GETERRORLOGS_COMMAND")
+	if cmd == "" {
+		cmd = `sh -c 'ls -l /tmp; cat /tmp/gcs.log;'`
+	}
+	proc, err := config.RunProcess(cmd, nil, &out, nil)
+	defer func() {
+		if proc != nil {
+			proc.Kill()
+			proc.Close()
+		}
+	}()
+	if err != nil {
+		logrus.Debugln("failed to get error logs: ", err)
+	}
+	proc.WaitTimeout(time.Duration(int(time.Second) * 10))
+	logrus.Debugf("(GCS Logs) %s (/GCS Logs)", strings.TrimSpace(out.String()))
 }

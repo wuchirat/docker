@@ -33,6 +33,7 @@ func (config *Config) HotAddVhd(hostPath string, containerPath string, readOnly 
 	}
 
 	if err := config.Uvm.Modify(modification); err != nil {
+		config.GetErrorLogs()
 		return fmt.Errorf("failed to modify utility VM configuration for hot-add: %s", err)
 	}
 	logrus.Debugf("opengcs: HotAddVhd: %s added successfully", hostPath)
