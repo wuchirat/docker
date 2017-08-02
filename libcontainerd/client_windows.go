@@ -302,6 +302,11 @@ func (clnt *client) createLinux(containerID string, checkpoint string, checkpoin
 			ImagePath:       `c:\Program Files\Linux Containers`,
 			LinuxKernelFile: `bootx64.efi`,
 			LinuxInitrdFile: `initrd.img`,
+
+			// The same auto detect logics used for the service VM can be used to pick between initrd and vhdx boot here
+			//          ImagePath:  `c:\Program Files\Linux Containers\lcow_container.vhdx`,
+			//          BootSource: "Vhd",
+			//          WritableBootSource : true,
 		},
 	}
 

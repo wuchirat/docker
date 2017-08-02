@@ -107,7 +107,9 @@ func ParseOptions(options []string) (Options, error) {
 		rOpts.KirdPath = filepath.Join(os.Getenv("ProgramFiles"), "Linux Containers")
 	}
 	if rOpts.Vhdx == "" {
-		rOpts.Vhdx = filepath.Join(rOpts.KirdPath, `uvm.vhdx`)
+		// If we want to have a single vhdx for both uvm and container vms, renaming it away from uvm.vhdx would
+		// make more sense.
+		rOpts.Vhdx = filepath.Join(rOpts.KirdPath, `lcow.vhdx`)
 	}
 	if rOpts.KernelFile == "" {
 		rOpts.KernelFile = `bootx64.efi`
@@ -128,6 +130,9 @@ func (config *Config) GenerateDefault(options []string) error {
 	if err != nil {
 		return err
 	}
+
+	// set the default requested mode to auto
+	config.RequestedMode = ModeRequestAuto
 
 	// Get the timeout from the environment
 	envTimeoutSeconds := 0
@@ -215,6 +220,7 @@ func (config *Config) Validate() error {
 		}
 	}
 
+	logrus.Debugf("opengcs: config.ActualMode", config.ActualMode)
 	return nil
 }
 
@@ -237,8 +243,12 @@ func (config *Config) StartUtilityVM() error {
 
 	if config.ActualMode == ModeActualVhdx {
 		configuration.HvRuntime = &hcsshim.HvRuntime{
-			ImagePath: config.Vhdx,
+			ImagePath:          config.Vhdx,
+			BootSource:         "Vhd",
+			WritableBootSource: true,
 		}
+		logrus.Debugf("opengcs: StartUtilityVM booting from  [%s]", config.Vhdx)
+
 	} else {
 		configuration.HvRuntime = &hcsshim.HvRuntime{
 			ImagePath:           config.KirdPath,
