@@ -226,6 +226,7 @@ type ImagePullOptions struct {
 	All           bool
 	RegistryAuth  string // RegistryAuth is the base64 encoded credentials for the registry
 	PrivilegeFunc RequestPrivilegeFunc
+	Platform      string
 }
 
 // RequestPrivilegeFunc is a function interface that
