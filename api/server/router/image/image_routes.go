@@ -78,48 +78,25 @@ func (s *imageRouter) postImagesCreate(ctx context.Context, w http.ResponseWrite
 	}
 
 	var (
-		image   = r.Form.Get("fromImage")
-		repo    = r.Form.Get("repo")
-		tag     = r.Form.Get("tag")
-		message = r.Form.Get("message")
-		err     error
-		output  = ioutils.NewWriteFlusher(w)
+		image    = r.Form.Get("fromImage")
+		repo     = r.Form.Get("repo")
+		tag      = r.Form.Get("tag")
+		message  = r.Form.Get("message")
+		platform = runtime.GOOS
+		err      error
+		output   = ioutils.NewWriteFlusher(w)
 	)
 	defer output.Close()
 
-	// TODO @jhowardmsft LCOW Support: Eventually we will need an API change
-	// so that platform comes from (for example) r.Form.Get("platform"). For
-	// the initial implementation, we assume that the platform is the
-	// runtime OS of the host. It will also need a validation function such
-	// as below which should be called after getting it from the API.
-	//
-	// Ensures the requested platform is valid and normalized
-	//func validatePlatform(req string) (string, error) {
-	//	req = strings.ToLower(req)
-	//	if req == "" {
-	//		req = runtime.GOOS // default to host platform
-	//	}
-	//	valid := []string{runtime.GOOS}
-	//
-	//	if system.LCOWSupported() {
-	//		valid = append(valid, "linux")
-	//	}
-	//
-	//	for _, item := range valid {
-	//		if req == item {
-	//			return req, nil
-	//		}
-	//	}
-	//	return "", fmt.Errorf("invalid platform requested: %s", req)
-	//}
-	//
-	// And in the call-site:
-	//	if platform, err = validatePlatform(platform); err != nil {
-	//		return err
-	//	}
-	platform := runtime.GOOS
-	if system.LCOWSupported() {
-		platform = "linux"
+	version := httputils.VersionFromContext(ctx)
+	if versions.GreaterThanOrEqualTo(version, "1.32") {
+		platform = strings.ToLower(r.FormValue("platform"))
+		if platform == "" {
+			platform = runtime.GOOS
+		}
+		if err := system.ValidatePlatform(platform); err != nil {
+			return err
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
