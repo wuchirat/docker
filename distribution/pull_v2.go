@@ -61,7 +61,7 @@ type v2Puller struct {
 	confirmedV2 bool
 }
 
-func (p *v2Puller) Pull(ctx context.Context, ref reference.Named) (err error) {
+func (p *v2Puller) Pull(ctx context.Context, ref reference.Named, platform string) (err error) {
 	// TODO(tiborvass): was ReceiveTimeout
 	p.repo, p.confirmedV2, err = NewV2Repository(ctx, p.repoInfo, p.endpoint, p.config.MetaHeaders, p.config.AuthConfig, "pull")
 	if err != nil {
@@ -69,7 +69,7 @@ func (p *v2Puller) Pull(ctx context.Context, ref reference.Named) (err error) {
 		return err
 	}
 
-	if err = p.pullV2Repository(ctx, ref); err != nil {
+	if err = p.pullV2Repository(ctx, ref, platform); err != nil {
 		if _, ok := err.(fallbackError); ok {
 			return err
 		}
@@ -84,10 +84,10 @@ func (p *v2Puller) Pull(ctx context.Context, ref reference.Named) (err error) {
 	return err
 }
 
-func (p *v2Puller) pullV2Repository(ctx context.Context, ref reference.Named) (err error) {
+func (p *v2Puller) pullV2Repository(ctx context.Context, ref reference.Named, platform string) (err error) {
 	var layersDownloaded bool
 	if !reference.IsNameOnly(ref) {
-		layersDownloaded, err = p.pullV2Tag(ctx, ref)
+		layersDownloaded, err = p.pullV2Tag(ctx, ref, platform)
 		if err != nil {
 			return err
 		}
@@ -109,7 +109,7 @@ func (p *v2Puller) pullV2Repository(ctx context.Context, ref reference.Named) (e
 			if err != nil {
 				return err
 			}
-			pulledNew, err := p.pullV2Tag(ctx, tagRef)
+			pulledNew, err := p.pullV2Tag(ctx, tagRef, platform)
 			if err != nil {
 				// Since this is the pull-all-tags case, don't
 				// allow an error pulling a particular tag to
@@ -325,7 +325,7 @@ func (ld *v2LayerDescriptor) Registered(diffID layer.DiffID) {
 	ld.V2MetadataService.Add(diffID, metadata.V2Metadata{Digest: ld.digest, SourceRepository: ld.repoInfo.Name.Name()})
 }
 
-func (p *v2Puller) pullV2Tag(ctx context.Context, ref reference.Named) (tagUpdated bool, err error) {
+func (p *v2Puller) pullV2Tag(ctx context.Context, ref reference.Named, platform string) (tagUpdated bool, err error) {
 	manSvc, err := p.repo.Manifests(ctx)
 	if err != nil {
 		return false, err
@@ -399,7 +399,7 @@ func (p *v2Puller) pullV2Tag(ctx context.Context, ref reference.Named) (tagUpdat
 			return false, err
 		}
 	case *manifestlist.DeserializedManifestList:
-		id, manifestDigest, err = p.pullManifestList(ctx, ref, v)
+		id, manifestDigest, err = p.pullManifestList(ctx, ref, v, platform)
 		if err != nil {
 			return false, err
 		}
@@ -701,27 +701,27 @@ func receiveConfig(s ImageConfigStore, configChan <-chan []byte, errChan <-chan 
 
 // pullManifestList handles "manifest lists" which point to various
 // platform-specific manifests.
-func (p *v2Puller) pullManifestList(ctx context.Context, ref reference.Named, mfstList *manifestlist.DeserializedManifestList) (id digest.Digest, manifestListDigest digest.Digest, err error) {
+func (p *v2Puller) pullManifestList(ctx context.Context, ref reference.Named, mfstList *manifestlist.DeserializedManifestList, platform string) (id digest.Digest, manifestListDigest digest.Digest, err error) {
 	manifestListDigest, err = schema2ManifestDigest(ref, mfstList)
 	if err != nil {
 		return "", "", err
 	}
 
-	logrus.Debugf("%s resolved to a manifestList object with %d entries; looking for a os/arch match", ref, len(mfstList.Manifests))
+	logrus.Debugf("%s resolved to a manifestList object with %d entries; looking for a %s/%s match", ref, len(mfstList.Manifests), platform, runtime.GOARCH)
 	var manifestDigest digest.Digest
 	for _, manifestDescriptor := range mfstList.Manifests {
 		// TODO(aaronl): The manifest list spec supports optional
 		// "features" and "variant" fields. These are not yet used.
 		// Once they are, their values should be interpreted here.
-		if manifestDescriptor.Platform.Architecture == runtime.GOARCH && manifestDescriptor.Platform.OS == runtime.GOOS {
+		if manifestDescriptor.Platform.Architecture == runtime.GOARCH && manifestDescriptor.Platform.OS == platform {
 			manifestDigest = manifestDescriptor.Digest
-			logrus.Debugf("found match for %s/%s with media type %s, digest %s", runtime.GOOS, runtime.GOARCH, manifestDescriptor.MediaType, manifestDigest.String())
+			logrus.Debugf("found match for %s/%s with media type %s, digest %s", platform, runtime.GOARCH, manifestDescriptor.MediaType, manifestDigest.String())
 			break
 		}
 	}
 
 	if manifestDigest == "" {
-		errMsg := fmt.Sprintf("no matching manifest for %s/%s in the manifest list entries", runtime.GOOS, runtime.GOARCH)
+		errMsg := fmt.Sprintf("no matching manifest for %s/%s in the manifest list entries", platform, runtime.GOARCH)
 		logrus.Debugf(errMsg)
 		return "", "", errors.New(errMsg)
 	}
