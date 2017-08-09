@@ -12,7 +12,7 @@ import (
 	"io"
 
 	"github.com/Microsoft/hcsshim"
-	"github.com/jhowardmsft/opengcs/gogcs/client"
+	"github.com/Microsoft/opengcs/client"
 	"github.com/sirupsen/logrus"
 )
 
