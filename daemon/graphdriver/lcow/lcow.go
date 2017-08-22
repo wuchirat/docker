@@ -110,21 +110,23 @@ const (
 	// scratchDirectory is the sub-folder under the driver's data-root used for scratch VHDs in service VMs
 	scratchDirectory = "scratch"
 
-	// ErrOperationPending is the HRESULT returned by the HCS when the VM termination operation is still pending.
+	// errOperationPending is the HRESULT returned by the HCS when the VM termination operation is still pending.
 	errOperationPending syscall.Errno = 0xc0370103
 )
 
 // Driver represents an LCOW graph driver.
 type Driver struct {
-	dataRoot           string             // Root path on the host where we are storing everything.
-	cachedSandboxFile  string             // Location of the local default-sized cached sandbox.
-	cachedSandboxMutex sync.Mutex         // Protects race conditions from multiple threads creating the cached sandbox.
-	cachedScratchFile  string             // Location of the local cached empty scratch space.
-	cachedScratchMutex sync.Mutex         // Protects race conditions from multiple threads creating the cached scratch.
-	options            []string           // Graphdriver options we are initialised with.
-	serviceVms         *serviceVMMap      // Map of the configs representing the service VM(s) we are running.
-	lcowfsMap          map[string]*lcowfs // Map of all the id -> lcowfs that we are maintaining
-	globalMode         bool               // Indicates if running in an unsafe/global service VM mode.
+	dataRoot           string     // Root path on the host where we are storing everything.
+	cachedSandboxFile  string     // Location of the local default-sized cached sandbox.
+	cachedSandboxMutex sync.Mutex // Protects race conditions from multiple threads creating the cached sandbox.
+	cachedScratchFile  string     // Location of the local cached empty scratch space.
+	cachedScratchMutex sync.Mutex // Protects race conditions from multiple threads creating the cached scratch.
+	options            []string   // Graphdriver options we are initialised with.
+	globalMode         bool       // Indicates if running in an unsafe/global service VM mode.
+
+	// NOTE: It is OK to use a cache here because Windows does not support
+	// restoring containers when the daemon dies.
+	serviceVms *serviceVMMap // Map of the configs representing the service VM(s) we are running.
 }
 
 // layerDetails is the structure returned by a helper function `getLayerDetails`
@@ -157,9 +159,10 @@ func InitDriver(dataRoot string, options []string, _, _ []idtools.IDMap) (graphd
 		options:           options,
 		cachedSandboxFile: filepath.Join(cd, sandboxFilename),
 		cachedScratchFile: filepath.Join(cd, scratchFilename),
-		serviceVms:        newServiceVMMap(),
-		globalMode:        false,
-		lcowfsMap:         make(map[string]*lcowfs),
+		serviceVms: &serviceVMMap{
+			svms: make(map[string]*serviceVMMapItem),
+		},
+		globalMode: false,
 	}
 
 	// Looks for relevant options
@@ -257,12 +260,10 @@ func (d *Driver) startServiceVMIfNotRunning(id string, mvdToAdd []hcsshim.Mapped
 	defer func() {
 		// Signal that start has finished, passing in the error if any.
 		svm.signalStartFinished(err)
-		if err == nil {
-			return
+		if err != nil {
+			// We added a ref to the VM, since we failed, we should delete the ref.
+			d.terminateServiceVM(id, "error path on startServiceVMIfNotRunning", false)
 		}
-
-		// We added a ref to the VM, since we failed, we should delete the ref.
-		d.terminateServiceVM(id, "error path on startServiceVMIfNotRunning", false)
 	}()
 
 	// Generate a default configuration
@@ -320,11 +321,18 @@ func (d *Driver) startServiceVMIfNotRunning(id string, mvdToAdd []hcsshim.Mapped
 		return nil, fmt.Errorf("failed to start service utility VM (%s): %s", context, err)
 	}
 
+	// defer function to terminate the VM if the next steps fail
+	defer func() {
+		if err != nil {
+			waitTerminate(svm, fmt.Sprintf("startServiceVmIfNotRunning: %s (%s)", id, context))
+		}
+	}()
+
 	// Now we have a running service VM, we can create the cached scratch file if it doesn't exist.
 	logrus.Debugf("%s locking cachedScratchMutex", title)
 	d.cachedScratchMutex.Lock()
 	if _, err := os.Stat(d.cachedScratchFile); err != nil {
-		logrus.Debugf("%s (%s): creating an SVM scratch - locking serviceVM", title, context)
+		logrus.Debugf("%s (%s): creating an SVM scratch", title, context)
 
 		// Don't use svm.CreateExt4Vhdx since that only works when the service vm is setup,
 		// but we're still in that process right now.
@@ -340,7 +348,7 @@ func (d *Driver) startServiceVMIfNotRunning(id string, mvdToAdd []hcsshim.Mapped
 
 	// Hot-add the scratch-space if not already attached
 	if !svm.scratchAttached {
-		logrus.Debugf("lcowdriver: startServiceVmIfNotRunning: (%s) hot-adding scratch %s - locking serviceVM", context, scratchTargetFile)
+		logrus.Debugf("lcowdriver: startServiceVmIfNotRunning: (%s) hot-adding scratch %s", context, scratchTargetFile)
 		if err := svm.hotAddVHDsNoLock(hcsshim.MappedVirtualDisk{
 			HostPath:          scratchTargetFile,
 			ContainerPath:     toolsScratchPath,
@@ -349,6 +357,7 @@ func (d *Driver) startServiceVMIfNotRunning(id string, mvdToAdd []hcsshim.Mapped
 			logrus.Debugf("%s: failed to hot-add scratch %s: %s", title, scratchTargetFile, err)
 			return nil, fmt.Errorf("failed to hot-add %s failed: %s", scratchTargetFile, err)
 		}
+		svm.scratchAttached = true
 	}
 
 	logrus.Debugf("lcowdriver: startServiceVmIfNotRunning: (%s) success", context)
@@ -373,10 +382,10 @@ func (d *Driver) terminateServiceVM(id, context string, force bool) (err error) 
 	var lastRef bool
 	if !force {
 		// In the not force case, we ref count
-		svm, lastRef, err = d.serviceVms.reduceRef(id)
+		svm, lastRef, err = d.serviceVms.decrementRefCount(id)
 	} else {
 		// In the force case, we ignore the ref count and just set it to 0
-		svm, err = d.serviceVms.reduceRefZero(id)
+		svm, err = d.serviceVms.setRefCountZero(id)
 		lastRef = true
 	}
 
@@ -391,11 +400,13 @@ func (d *Driver) terminateServiceVM(id, context string, force bool) (err error) 
 	// We run the deletion of the scratch as a deferred function to at least attempt
 	// clean-up in case of errors.
 	defer func() {
-		scratchTargetFile := filepath.Join(d.dataRoot, scratchDirectory, fmt.Sprintf("%s.vhdx", id))
-		logrus.Debugf("lcowdriver: terminateservicevm: %s (%s) - deleting scratch %s", id, context, scratchTargetFile)
-		if errRemove := os.Remove(scratchTargetFile); errRemove != nil {
-			logrus.Warnf("failed to remove scratch file %s (%s): %s", scratchTargetFile, context, errRemove)
-			err = errRemove
+		if svm.scratchAttached {
+			scratchTargetFile := filepath.Join(d.dataRoot, scratchDirectory, fmt.Sprintf("%s.vhdx", id))
+			logrus.Debugf("lcowdriver: terminateservicevm: %s (%s) - deleting scratch %s", id, context, scratchTargetFile)
+			if errRemove := os.Remove(scratchTargetFile); errRemove != nil {
+				logrus.Warnf("failed to remove scratch file %s (%s): %s", scratchTargetFile, context, errRemove)
+				err = errRemove
+			}
 		}
 
 		// This function shouldn't actually return error unless there is a bug
@@ -407,9 +418,29 @@ func (d *Driver) terminateServiceVM(id, context string, force bool) (err error) 
 		svm.signalStopFinished(err)
 	}()
 
-	logrus.Debugf("lcowdriver: terminateservicevm: %s (%s) - calling terminate", id, context)
+	// Now it's possible that the serivce VM failed to start and now we are trying to termiante it.
+	// In this case, we will relay the error to the goroutines waiting for this vm to stop.
+	if err := svm.getStartError(); err != nil {
+		logrus.Debugf("lcowdriver: terminateservicevm: %s had failed to start up: %s", id, err)
+		return err
+	}
+
+	if err := waitTerminate(svm, fmt.Sprintf("terminateservicevm: %s (%s)", id, context)); err != nil {
+		return err
+	}
+
+	logrus.Debugf("lcowdriver: terminateservicevm: %s (%s) - success", id, context)
+	return nil
+}
+
+func waitTerminate(svm *serviceVM, context string) error {
+	if svm.config == nil {
+		return fmt.Errorf("lcowdriver: waitTermiante: Nil utility VM. %s", context)
+	}
+
+	logrus.Debugf("lcowdriver: waitTerminate: Calling terminate: %s", context)
 	if err := svm.config.Uvm.Terminate(); err != nil {
-		// We might get Operationg still pending from the HCS. In that case, we shouldn't return
+		// We might get operation still pending from the HCS. In that case, we shouldn't return
 		// an error since we call wait right after.
 		underlyingError := err
 		if conterr, ok := err.(*hcsshim.ContainerError); ok {
@@ -423,15 +454,13 @@ func (d *Driver) terminateServiceVM(id, context string, force bool) (err error) 
 		if underlyingError != errOperationPending {
 			return fmt.Errorf("failed to terminate utility VM (%s): %s", context, err)
 		}
-		logrus.Debugf("lcowdriver: terminateservicevm: %s uvm.Terminate() returned operation pending", id)
+		logrus.Debugf("lcowdriver: waitTerminate: uvm.Terminate() returned operation pending (%s)", context)
 	}
 
-	logrus.Debugf("lcowdriver: terminateservicevm: %s (%s) - waiting for utility VM to terminate", id, context)
+	logrus.Debugf("lcowdriver: waitTerminate: (%s) - waiting for utility VM to terminate", context)
 	if err := svm.config.Uvm.WaitTimeout(time.Duration(svm.config.UvmTimeoutSeconds) * time.Second); err != nil {
 		return fmt.Errorf("failed waiting for utility VM to terminate (%s): %s", context, err)
 	}
-
-	logrus.Debugf("lcowdriver: terminateservicevm: %s (%s) - success", id, context)
 	return nil
 }
 

@@ -197,6 +197,8 @@ func (l *lcowfs) readDirNames(dirname string) ([]string, error) {
 	return names, nil
 }
 
+// Note that Go's filepath.FromSlash/ToSlash convert between OS paths and '/'. Since the path separator
+// for LCOW (and Unix) is '/', they are no-ops.
 func (l *lcowfs) FromSlash(path string) string {
 	return path
 }

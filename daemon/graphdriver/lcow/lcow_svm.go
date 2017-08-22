@@ -25,12 +25,12 @@ var errVMStillHasReference = errors.New("Attemping to delete a VM that is still 
 // serviceVMMap is the struct representing the id -> service VM mapping.
 type serviceVMMap struct {
 	sync.Mutex
-	svms map[string]*serviceVMWithRef
+	svms map[string]*serviceVMMapItem
 }
 
-// serviceVMWithRef is our internal structure representing an item in our
+// serviceVMMapItem is our internal structure representing an item in our
 // map of service VMs we are maintaining.
-type serviceVMWithRef struct {
+type serviceVMMapItem struct {
 	svm      *serviceVM // actual service vm object
 	refCount int        // refcount for VM
 }
@@ -40,7 +40,7 @@ type serviceVM struct {
 	scratchAttached bool           // Has a scratch been attached?
 	config          *client.Config // Represents the service VM item.
 
-	// Indicate that the vm is started
+	// Indicates that the vm is started
 	startStatus chan interface{}
 	startError  error
 
@@ -48,23 +48,15 @@ type serviceVM struct {
 	stopStatus chan interface{}
 	stopError  error
 
-	// NOTE: It is OK to use a cache here because Windows does not support
-	// restoring containers when the daemon dies.
-	attachedVHDs map[string]int // Map ref counting all the VHDS we've mounted/unmounted.
+	attachedVHDs map[string]int // Map ref counting all the VHDS we've hot-added/hot-removed.
 	unionMounts  map[string]int // Map ref counting all the union filesystems we mounted.
 }
 
-func newServiceVMMap() *serviceVMMap {
-	return &serviceVMMap{
-		svms: make(map[string]*serviceVMWithRef),
-	}
-}
-
-// add will add an id to the service vm map. There are a couple of cases:
+// add will add an id to the service vm map. There are three cases:
 // 	- entry doesn't exist:
 // 		- add id to map and return a new vm that the caller can manually configure+start
 //	- entry does exist
-//  	- return vm in map and add to ref count
+//  	- return vm in map and increment ref count
 //  - entry does exist but the ref count is 0
 //		- return the svm and errVMisTerminating. Caller can call svm.getStopError() to wait for stop
 func (svmMap *serviceVMMap) add(id string) (svm *serviceVM, alreadyExists bool, err error) {
@@ -79,15 +71,21 @@ func (svmMap *serviceVMMap) add(id string) (svm *serviceVM, alreadyExists bool, 
 	}
 
 	// Doesn't exist, so create an empty svm to put into map and return
-	newSVM := newServiceVM()
-	svmMap.svms[id] = &serviceVMWithRef{
+	newSVM := &serviceVM{
+		startStatus:  make(chan interface{}),
+		stopStatus:   make(chan interface{}),
+		attachedVHDs: make(map[string]int),
+		unionMounts:  make(map[string]int),
+		config:       &client.Config{},
+	}
+	svmMap.svms[id] = &serviceVMMapItem{
 		svm:      newSVM,
 		refCount: 1,
 	}
 	return newSVM, false, nil
 }
 
-// get will get the service vm from the map. There are a couple of cases:
+// get will get the service vm from the map. There are three cases:
 // 	- entry doesn't exist:
 // 		- return errVMUnknown
 //	- entry does exist
@@ -107,7 +105,7 @@ func (svmMap *serviceVMMap) get(id string) (*serviceVM, error) {
 	return svm.svm, nil
 }
 
-// Reduces the ref count of the given ID from the map. There are a couple of cases:
+// decrementRefCount decrements the ref count of the given ID from the map. There are four cases:
 // 	- entry doesn't exist:
 // 		- return errVMUnknown
 //  - entry does exist but the ref count is 0
@@ -115,9 +113,9 @@ func (svmMap *serviceVMMap) get(id string) (*serviceVM, error) {
 //	- entry does exist but ref count is 1
 //  	- return vm and set lastRef to true. The caller can then stop the vm, delete the id from this map
 //      - and execute svm.signalStopFinished to signal the threads that the svm has been terminated.
-//	- entry does exist
+//	- entry does exist and ref count > 1
 //		- just reduce ref count and return svm
-func (svmMap *serviceVMMap) reduceRef(id string) (_ *serviceVM, lastRef bool, _ error) {
+func (svmMap *serviceVMMap) decrementRefCount(id string) (_ *serviceVM, lastRef bool, _ error) {
 	svmMap.Lock()
 	defer svmMap.Unlock()
 
@@ -132,8 +130,8 @@ func (svmMap *serviceVMMap) reduceRef(id string) (_ *serviceVM, lastRef bool, _ 
 	return svm.svm, svm.refCount == 0, nil
 }
 
-// Works the same way as reduceRef, but sets ref count to 0 instead of decrementing it.
-func (svmMap *serviceVMMap) reduceRefZero(id string) (*serviceVM, error) {
+// setRefCountZero works the same way as decrementRefCount, but sets ref count to 0 instead of decrementing it.
+func (svmMap *serviceVMMap) setRefCountZero(id string) (*serviceVM, error) {
 	svmMap.Lock()
 	defer svmMap.Unlock()
 
@@ -148,7 +146,7 @@ func (svmMap *serviceVMMap) reduceRefZero(id string) (*serviceVM, error) {
 	return svm.svm, nil
 }
 
-// Deletes the given ID from the map. If the refcount is not 0 or the
+// deleteID deletes the given ID from the map. If the refcount is not 0 or the
 // VM does not exist, then this function returns an error.
 func (svmMap *serviceVMMap) deleteID(id string) error {
 	svmMap.Lock()
@@ -162,16 +160,6 @@ func (svmMap *serviceVMMap) deleteID(id string) error {
 	}
 	delete(svmMap.svms, id)
 	return nil
-}
-
-func newServiceVM() *serviceVM {
-	return &serviceVM{
-		startStatus:  make(chan interface{}),
-		stopStatus:   make(chan interface{}),
-		attachedVHDs: make(map[string]int),
-		unionMounts:  make(map[string]int),
-		config:       &client.Config{},
-	}
 }
 
 func (svm *serviceVM) signalStartFinished(err error) {
@@ -203,8 +191,7 @@ func (svm *serviceVM) getStopError() error {
 }
 
 func (svm *serviceVM) hotAddVHDs(mvds ...hcsshim.MappedVirtualDisk) error {
-	err := svm.getStartError()
-	if err != nil {
+	if err := svm.getStartError(); err != nil {
 		return err
 	}
 
@@ -215,8 +202,7 @@ func (svm *serviceVM) hotAddVHDs(mvds ...hcsshim.MappedVirtualDisk) error {
 
 func (svm *serviceVM) hotAddVHDsNoLock(mvds ...hcsshim.MappedVirtualDisk) error {
 	for i, mvd := range mvds {
-		_, ok := svm.attachedVHDs[mvd.HostPath]
-		if ok {
+		if _, ok := svm.attachedVHDs[mvd.HostPath]; ok {
 			svm.attachedVHDs[mvd.HostPath]++
 			continue
 		}
@@ -231,8 +217,7 @@ func (svm *serviceVM) hotAddVHDsNoLock(mvds ...hcsshim.MappedVirtualDisk) error 
 }
 
 func (svm *serviceVM) hotRemoveVHDs(mvds ...hcsshim.MappedVirtualDisk) error {
-	err := svm.getStartError()
-	if err != nil {
+	if err := svm.getStartError(); err != nil {
 		return err
 	}
 
@@ -244,24 +229,27 @@ func (svm *serviceVM) hotRemoveVHDs(mvds ...hcsshim.MappedVirtualDisk) error {
 func (svm *serviceVM) hotRemoveVHDsNoLock(mvds ...hcsshim.MappedVirtualDisk) error {
 	var retErr error
 	for _, mvd := range mvds {
-		hostPath := mvd.HostPath
-		_, ok := svm.attachedVHDs[hostPath]
-		if !ok {
+		if _, ok := svm.attachedVHDs[mvd.HostPath]; !ok {
+			// We continue instead of returning an error if we try to hot remove a non-existent VHD.
+			// This is because one of the callers of the function is graphdriver.Put(). Since graphdriver.Get()
+			// defers the VM start to the first operation, it's possible that nothing have been hot-added
+			// when Put() is called. To avoid Put returning an error in that case, we simply continue if we
+			// don't find the vhd attached.
 			continue
 		}
 
-		if svm.attachedVHDs[hostPath] != 1 {
-			svm.attachedVHDs[hostPath]--
+		if svm.attachedVHDs[mvd.HostPath] > 0 {
+			svm.attachedVHDs[mvd.HostPath]--
 			continue
 		}
 
 		// last VHD, so remove from VM and map
-		err := svm.config.HotRemoveVhd(hostPath)
-		if err == nil {
-			delete(svm.attachedVHDs, hostPath)
+
+		if err := svm.config.HotRemoveVhd(mvd.HostPath); err == nil {
+			delete(svm.attachedVHDs, mvd.HostPath)
 		} else {
 			// Take note of the error, but still continue to remove the other VHDs
-			logrus.Warnf("Failed to hot remove %s: %s", hostPath, err)
+			logrus.Warnf("Failed to hot remove %s: %s", mvd.HostPath, err)
 			if retErr == nil {
 				retErr = err
 			}
@@ -271,8 +259,7 @@ func (svm *serviceVM) hotRemoveVHDsNoLock(mvds ...hcsshim.MappedVirtualDisk) err
 }
 
 func (svm *serviceVM) createExt4VHDX(destFile string, sizeGB uint32, cacheFile string) error {
-	err := svm.getStartError()
-	if err != nil {
+	if err := svm.getStartError(); err != nil {
 		return err
 	}
 
@@ -283,18 +270,16 @@ func (svm *serviceVM) createExt4VHDX(destFile string, sizeGB uint32, cacheFile s
 
 func (svm *serviceVM) createUnionMount(mountName string, mvds ...hcsshim.MappedVirtualDisk) (err error) {
 	if len(mvds) == 0 {
-		return fmt.Errorf("createUnionMount: error must have atleast 1 layer")
+		return fmt.Errorf("createUnionMount: error must have at least 1 layer")
 	}
 
-	err = svm.getStartError()
-	if err != nil {
+	if err = svm.getStartError(); err != nil {
 		return err
 	}
 
 	svm.Lock()
 	defer svm.Unlock()
-	_, ok := svm.unionMounts[mountName]
-	if ok {
+	if _, ok := svm.unionMounts[mountName]; ok {
 		svm.unionMounts[mountName]++
 		return nil
 	}
@@ -309,8 +294,7 @@ func (svm *serviceVM) createUnionMount(mountName string, mvds ...hcsshim.MappedV
 	}
 
 	logrus.Debugf("Doing the overlay mount with union directory=%s", mountName)
-	err = svm.runProcess(fmt.Sprintf("mkdir -p %s", mountName), nil, nil, nil)
-	if err != nil {
+	if err = svm.runProcess(fmt.Sprintf("mkdir -p %s", mountName), nil, nil, nil); err != nil {
 		return err
 	}
 
@@ -324,8 +308,7 @@ func (svm *serviceVM) createUnionMount(mountName string, mvds ...hcsshim.MappedV
 		upper := fmt.Sprintf("%s/upper", mvds[0].ContainerPath)
 		work := fmt.Sprintf("%s/work", mvds[0].ContainerPath)
 
-		err = svm.runProcess(fmt.Sprintf("mkdir -p %s %s", upper, work), nil, nil, nil)
-		if err != nil {
+		if err = svm.runProcess(fmt.Sprintf("mkdir -p %s %s", upper, work), nil, nil, nil); err != nil {
 			return err
 		}
 
@@ -337,8 +320,7 @@ func (svm *serviceVM) createUnionMount(mountName string, mvds ...hcsshim.MappedV
 	}
 
 	logrus.Debugf("createUnionMount: Executing mount=%s", cmd)
-	err = svm.runProcess(cmd, nil, nil, nil)
-	if err != nil {
+	if err = svm.runProcess(cmd, nil, nil, nil); err != nil {
 		return err
 	}
 
@@ -347,26 +329,23 @@ func (svm *serviceVM) createUnionMount(mountName string, mvds ...hcsshim.MappedV
 }
 
 func (svm *serviceVM) deleteUnionMount(mountName string, disks ...hcsshim.MappedVirtualDisk) error {
-	err := svm.getStartError()
-	if err != nil {
+	if err := svm.getStartError(); err != nil {
 		return err
 	}
 
 	svm.Lock()
 	defer svm.Unlock()
-	_, ok := svm.unionMounts[mountName]
-	if !ok {
+	if _, ok := svm.unionMounts[mountName]; !ok {
 		return nil
 	}
 
-	if svm.unionMounts[mountName] != 1 {
+	if svm.unionMounts[mountName] > 0 {
 		svm.unionMounts[mountName]--
 		return nil
 	}
 
 	logrus.Debugf("Removing union mount %s", mountName)
-	err = svm.runProcess(fmt.Sprintf("umount %s", mountName), nil, nil, nil)
-	if err != nil {
+	if err := svm.runProcess(fmt.Sprintf("umount %s", mountName), nil, nil, nil); err != nil {
 		return err
 	}
 
